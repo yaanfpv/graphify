@@ -128,6 +128,17 @@ BACKENDS: dict[str, dict] = {
         # CLI's Read tool rather than as inline base64 (see `_call_claude_cli`).
         "vision": True,
     },
+    "codex-cli": {
+        # Routes through the locally-installed `codex` CLI (OpenAI Codex) using
+        # `codex exec`. Authenticates via the user's existing ChatGPT/Codex
+        # subscription instead of an OPENAI_API_KEY — costs bill to the plan.
+        # Local images are passed with `-i`, so this is a keyless vision path.
+        "default_model": "codex-cli-plan",
+        "pricing": {"input": 0.0, "output": 0.0},
+        "temperature": 0,
+        "max_tokens": 16384,
+        "vision": True,
+    },
 }
 
 
@@ -260,10 +271,10 @@ _IMAGE_TOKEN_ESTIMATE = 1_600
 # many for the claude-cli Read-tool loop to work through. Keeps memory and
 # request size bounded on image-dense corpora.
 _MAX_IMAGES_PER_CHUNK = 20
-# Backends that read an image by file path (claude-cli's Read tool)
+# Backends that read an image by file path (claude-cli's Read tool, codex's -i)
 # instead of inlining base64. They open the file themselves and downsample as
 # needed, so `_MAX_IMAGE_BYTES` does not apply and the bytes never need loading.
-_PATH_IMAGE_BACKENDS = {"claude-cli"}
+_PATH_IMAGE_BACKENDS = {"claude-cli", "codex-cli"}
 
 
 @dataclass
@@ -307,7 +318,7 @@ def _build_image_refs(image_files: list[Path], root: Path, *, read_bytes: bool =
 
     `read_bytes=True` (base64 backends) loads the pixels and drops any image over
     `_MAX_IMAGE_BYTES` to a reference, because a base64 request body has a hard
-    size ceiling. `read_bytes=False` (path-based backends — claude-cli)
+    size ceiling. `read_bytes=False` (path-based backends — claude-cli, codex-cli)
     skips the read entirely: those backends open the file themselves and
     downsample as needed, so there is no per-image size limit and no reason to
     load (potentially tens of MB of) bytes that would never be used.
@@ -867,6 +878,116 @@ def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bo
     return result
 
 
+def _run_codex_exec(prompt: str, image_paths: list[str], *, timeout: int = 600) -> str:
+    """Run `codex exec` read-only and ephemeral, returning the final agent message.
+
+    Shared by the codex-cli extraction backend and the lightweight `_call_llm`
+    path so the sandbox flags (`--ephemeral --skip-git-repo-check
+    --sandbox read-only`) are defined in exactly one place and cannot drift.
+    Images are attached with `-i`; callers pass absolute paths (see
+    `_call_codex_cli`) so a filename like `-foo.png` is never read as a flag.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    if shutil.which("codex") is None:
+        raise RuntimeError(
+            "Codex CLI not found on $PATH. Install from "
+            "https://developers.openai.com/codex and run `codex` once to authenticate."
+        )
+
+    fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="graphify-codex-")
+    os.close(fd)
+    cli_args = [
+        "codex", "exec",
+        "--ephemeral",            # no per-call session rollout file
+        "--skip-git-repo-check",  # graphify runs from arbitrary directories
+        "--sandbox", "read-only",  # unattended, never writes, never prompts
+        "-C", tempfile.gettempdir(),
+        "--output-last-message", out_path,
+    ]
+    cli_model = os.environ.get("GRAPHIFY_CODEX_CLI_MODEL", "").strip()
+    if cli_model:
+        cli_args.extend(["--model", cli_model])
+    for img in image_paths:
+        cli_args.extend(["-i", img])
+    cli_args.extend(["--", prompt])  # `--` ends the variadic -i and protects the prompt
+
+    try:
+        proc = subprocess.run(
+            cli_args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"codex exec exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+            )
+        try:
+            with open(out_path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError as exc:
+            raise RuntimeError(
+                f"codex exec produced no output file: {exc}; "
+                f"stderr: {proc.stderr.strip()[:500]!r}"
+            ) from exc
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+
+
+def _call_codex_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bool = False, images: list[_ImageRef] | None = None) -> dict:
+    """Call OpenAI Codex via the locally-installed `codex exec` CLI.
+
+    Routes through the user's ChatGPT/Codex subscription instead of an
+    OPENAI_API_KEY, giving Pro subscribers a keyless vision path: local images
+    are attached with `-i` (Codex reads the pixels directly, no base64).
+
+    Codex `exec` has no separate system-prompt slot, so the extraction
+    instructions are prepended to the prompt. Run read-only and ephemeral so it
+    never prompts for approval, never writes into the corpus, and leaves no
+    session rollout file behind. The final agent message is captured via
+    `--output-last-message` (clean text, no event log).
+    """
+    images = images or []
+    # Attach an image only when it is readable (raw set) and still on disk, and
+    # always as an ABSOLUTE path. Absolute matters: a corpus image named e.g.
+    # `-foo.png` passed as a bare relative arg could be misparsed by codex's arg
+    # parser as a flag; an absolute path (`/.../-foo.png`) starts with `/` and is
+    # always safe. Gating on `raw` also keeps the `-i` set consistent with the
+    # "(not shown ...)" note `_image_notes` adds for refs without pixels.
+    image_paths: list[str] = []
+    for r in images:
+        if r.raw is None or not r.path.is_file():
+            continue
+        image_paths.append(str(r.path if r.path.is_absolute() else r.path.resolve()))
+    prompt = _extraction_system(deep=deep_mode) + "\n\n" + _with_image_notes(user_message, images)
+
+    raw_content = _run_codex_exec(prompt, image_paths)
+
+    result = _parse_llm_json(raw_content or "{}")
+    # `codex exec` does not surface token usage through the last-message file;
+    # the backend is plan-billed (pricing 0) so this is informational only.
+    result["input_tokens"] = 0
+    result["output_tokens"] = 0
+    result["model"] = os.environ.get("GRAPHIFY_CODEX_CLI_MODEL", "").strip() or "codex-cli-plan"
+    # Codex has no truncation signal; treat a hollow response as `length` so the
+    # adaptive-retry layer bisects the chunk, consistent with every other backend.
+    result["finish_reason"] = "stop"
+    if _response_is_hollow(raw_content, result):
+        print(
+            "[graphify] codex-cli returned a hollow response; treating as "
+            "truncation so adaptive retry can bisect the chunk.",
+            file=sys.stderr,
+        )
+        result["finish_reason"] = "length"
+    return result
 
 
 def _call_bedrock(model: str, user_message: str, max_tokens: int = 8192, *, deep_mode: bool = False, images: list[_ImageRef] | None = None) -> dict:
@@ -954,7 +1075,7 @@ def extract_files_direct(
             file=sys.stderr,
         )
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "codex-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. "
             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
@@ -967,7 +1088,7 @@ def extract_files_direct(
     user_msg = _read_files(text_files, root)
     vision = _backend_supports_vision(backend)
     # Only base64 (inline) vision backends need the bytes loaded + size-capped;
-    # path-based backends (claude-cli) and non-vision backends do not.
+    # path-based backends (claude-cli, codex-cli) and non-vision backends do not.
     read_bytes = vision and backend not in _PATH_IMAGE_BACKENDS
     image_refs = _build_image_refs(image_files, root, read_bytes=read_bytes) if image_files else []
     if image_refs and not vision:
@@ -978,6 +1099,8 @@ def extract_files_direct(
         return _call_claude(key, mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     if backend == "claude-cli":
         return _call_claude_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
+    if backend == "codex-cli":
+        return _call_codex_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     if backend == "bedrock":
         return _call_bedrock(mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     return _call_openai_compat(
@@ -1386,7 +1509,7 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
         ollama_url = os.environ.get("OLLAMA_BASE_URL", cfg.get("base_url", ""))
         _validate_ollama_base_url(ollama_url)
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "codex-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. Set {_format_backend_env_keys(backend)}."
         )
@@ -1426,6 +1549,8 @@ def _call_llm(prompt: str, *, backend: str, max_tokens: int = 200) -> str:
             raise RuntimeError(f"claude -p produced unparseable JSON envelope: {exc}") from exc
         return envelope.get("result", "")
 
+    if backend == "codex-cli":
+        return _run_codex_exec(prompt, [])
 
     if backend == "bedrock":
         try:
@@ -1531,7 +1656,7 @@ def detect_backend() -> str | None:
         _validate_ollama_base_url(ollama_url)
         return "ollama"
     for name in BACKENDS:
-        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "bedrock", "ollama", "claude-cli"):
+        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "bedrock", "ollama", "claude-cli", "codex-cli"):
             if _get_backend_api_key(name):
                 return name
     return None
